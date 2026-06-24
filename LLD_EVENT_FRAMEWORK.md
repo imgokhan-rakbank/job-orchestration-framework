@@ -31,7 +31,7 @@ Producers -> event_log (Delta) -> Dependency Engine -> ADLS _READY trigger file
 
 ## 4. Event Producers
 
-1. Control table changes (EOD completion, batch stages)
+1. Control table condition events (EOD completion, batch stages)
 2. Bronze readiness conditions
 3. ADF pipeline completion events
 4. Databricks job completion events (Silver/Gold/DQ)
@@ -109,33 +109,42 @@ PARTITIONED BY (partition_date);
 
 ## 6. Event Ingestion Patterns
 
-## 6.1 CDC (Kafka -> Databricks -> Delta)
+## 6.1 Control-table condition events (in scope)
 
 ```text
-Source DB -> Kafka topic -> Databricks structured streaming -> event_log MERGE
+Control tables are ingested to Bronze by CDC (outside this LLD scope).
+Bronze control data + git-driven condition config -> condition evaluation -> event_log MERGE
 ```
 
 ```python
 from pyspark.sql import functions as F
 
-events = (
-  spark.readStream.format("kafka")
-  .option("kafka.bootstrap.servers", "<server>")
-  .option("subscribe", "cdc.events")
-  .load()
-  .selectExpr("CAST(value AS STRING) AS raw_json")
+control_data = spark.table("bronze.control_table_updates")
+conditions = spark.table("orchestration.control_condition_config").filter("is_active = true")
+
+eligible = (
+  control_data.alias("d")
+  .join(conditions.alias("c"), F.col("d.source_system") == F.col("c.source_system"))
+  .filter("d.business_date IS NOT NULL")
+  .filter("d.current_stage = c.expected_stage")
 )
 
 normalized = (
-  events.select(
-    F.get_json_object("raw_json", "$.source_system").alias("source_system"),
-    F.get_json_object("raw_json", "$.source_object").alias("source_object"),
-    F.get_json_object("raw_json", "$.business_date").cast("date").alias("business_date"),
-    F.get_json_object("raw_json", "$.event_ts").cast("timestamp").alias("event_ts"),
-    F.lit("CONTROL_STATUS_CHANGED").alias("event_type"),
-    F.lit("KAFKA").alias("event_source"),
+  eligible.select(
+    F.col("d.source_system").alias("source_system"),
+    F.col("d.control_table").alias("source_object"),
+    F.col("d.business_date").cast("date").alias("business_date"),
+    F.col("d.update_ts").cast("timestamp").alias("event_ts"),
+    F.col("c.event_type").alias("event_type"),
+    F.lit("CONTROL_CONDITION_EVAL").alias("event_source"),
     F.lit("SUCCESS").alias("status"),
-    F.col("raw_json").alias("payload")
+    F.to_json(
+      F.struct(
+        F.col("d.current_stage").alias("observed_stage"),
+        F.col("c.expected_stage").alias("expected_stage"),
+        F.col("d.control_row_id").alias("control_row_id")
+      )
+    ).alias("payload")
   )
   .withColumn("event_id", F.sha2(F.concat_ws("|", "event_type", "source_system", "source_object", F.col("business_date")), 256))
   .withColumn("payload_hash", F.sha2("payload", 256))
@@ -147,7 +156,7 @@ normalized = (
 ## 6.2 Polling-based ingestion
 
 ```text
-ADF/Databricks poller -> source control table -> transitions to COMPLETED -> event_log MERGE
+ADF/Databricks poller -> Bronze control table delta -> evaluate configured condition -> event_log MERGE
 ```
 
 ## 6.3 Databricks post-run event
@@ -159,7 +168,33 @@ Databricks job success -> write DATABRICKS_JOB_COMPLETED into event_log
 ## 6.4 ADF completion event
 
 ```text
-ADF final activity -> emit completion event file/API call -> event normalization -> event_log
+ADF final activity -> insert completion event directly into event_log
+```
+
+```sql
+INSERT INTO orchestration.event_log
+SELECT
+  sha2(concat_ws('|','ADF_PIPELINE_COMPLETED','PLATFORM','adf_ingest_finance',cast(current_date() as string),'SUCCESS',@{pipeline().RunId}), 256) AS event_id,
+  'ADF_PIPELINE_COMPLETED' AS event_type,
+  'ADF' AS event_source,
+  'PLATFORM' AS source_system,
+  'adf_ingest_finance' AS source_object,
+  current_date() AS business_date,
+  current_timestamp() AS event_ts,
+  current_timestamp() AS ingest_ts,
+  'SUCCESS' AS status,
+  1 AS event_version,
+  '@{pipeline().RunId}' AS correlation_id,
+  '@{pipeline().RunId}' AS run_id,
+  current_date() AS partition_date,
+  '{"pipeline":"adf_ingest_finance"}' AS payload,
+  sha2('{"pipeline":"adf_ingest_finance"}', 256) AS payload_hash,
+  'adf_spn' AS producer_id,
+  false AS replay_flag,
+  null AS replay_batch_id,
+  null AS dedupe_key,
+  'adf_spn' AS created_by,
+  current_timestamp() AS created_ts;
 ```
 
 ## 7. Dependency Engine (Databricks)
@@ -235,6 +270,9 @@ required_events:
     source_object: string|null
     status: string
     business_date_offset: integer
+control_condition:
+  expected_stage: string
+  eval_expression: string
 downstream:
   trigger_type: ADLS_FILE
   trigger_path: string
@@ -264,6 +302,9 @@ required_events:
     source_object: EOD
     status: SUCCESS
     business_date_offset: 0
+control_condition:
+  expected_stage: EOD_COMPLETED
+  eval_expression: "current_stage = 'EOD_COMPLETED'"
 downstream:
   trigger_type: ADLS_FILE
   trigger_path: /triggers/daily_finance_ingest/{business_date}/_READY.json
@@ -273,6 +314,12 @@ metadata:
   owner: data-platform
   sla_minutes: 30
 ```
+
+## 8.4 Config deployment behavior
+
+- Control-condition definitions are maintained in Git with the job config.
+- On Git change, CI/CD updates `orchestration.control_condition_config` Delta table.
+- Dependency/event evaluators read only the Delta config tables at runtime.
 
 ## 9. Trigger File Generation (Critical)
 
@@ -336,8 +383,10 @@ dbutils.fs.put(path, json.dumps(payload), overwrite=False)
 
 ## 10.2 Databricks
 
-- Option A: Auto Loader streaming consumption (recommended for scale)
-- Option B: periodic batch scan (simple, low volume)
+- Databricks jobs consume `/triggers/*/*/_READY.json` as file triggers.
+- Option A: Auto Loader streaming listener (recommended for scale)
+- Option B: periodic file-listener batch job (simple, low volume)
+- Trigger detection stays in listener layer; downstream jobs must not embed dependency-evaluation logic.
 - Maintain checkpoint and dedupe by trigger_id
 
 ## 11. Multi-Condition Join Logic
